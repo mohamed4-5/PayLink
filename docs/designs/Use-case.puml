@@ -1,0 +1,120 @@
+@startuml 01-use-case
+title PayLink - Use-case diagram
+left to right direction
+skinparam packageStyle rectangle
+skinparam shadowing false
+skinparam nodesep 40
+skinparam ranksep 120
+skinparam ArrowFontSize 11
+
+actor Customer
+actor Agent
+actor Support
+actor Admin
+actor "Finance team" as Finance
+actor "Billers\n(ElectroCo, AquaCo,\nTopUpNet, NetCo)" as Biller <<external>>
+actor "SMS / Push\nprovider" as Notifier <<external>>
+actor "Timer / Scheduler" as Timer <<system>>
+
+rectangle "PayLink backend" {
+
+  package "Accounts and Wallet" {
+    usecase "Register" as UC_REG
+    usecase "Upgrade verification" as UC_VER
+    usecase "View wallet and history" as UC_WAL
+    usecase "Top up wallet" as UC_TOP
+  }
+
+  package "Biller Catalog" {
+    usecase "Manage billers and services" as UC_MAN
+    usecase "Browse billers" as UC_BRO
+  }
+
+  package "Payment Processing" {
+    usecase "Run bill inquiry" as UC_INQ
+    usecase "Pay a bill" as UC_PAY
+    usecase "Handle payment timeout / unknown result" as UC_UNK
+    usecase "Receive biller callback" as UC_CB
+    usecase "Pay on behalf of customer" as UC_AGP
+    usecase "Refund failed payment (release hold)" as UC_RFF
+    usecase "Request refund (Completed payment)" as UC_RFQ
+    usecase "Approve refund (Completed payment)" as UC_RFA
+    usecase "Retry unknown payments\nand recover stuck payments" as UC_RTY
+  }
+
+  package "Fees, Fraud and Support" {
+    usecase "Calculate fee and commission" as UC_FEE
+    usecase "Check limits and velocity" as UC_FRD
+    usecase "Search payment" as UC_SRC
+    usecase "Block / unblock account" as UC_BLK
+  }
+
+  package "Notifications, Admin and Reporting" {
+    usecase "Send receipt / failure / refund message" as UC_NOT
+    usecase "Retry failed notifications" as UC_NRT
+    usecase "Edit configuration" as UC_CFG
+    usecase "Read audit log" as UC_AUD
+    usecase "Run reconciliation" as UC_REC
+    usecase "View daily totals" as UC_TOT
+  }
+}
+
+' --- Customer-facing capabilities ---
+Customer --> UC_REG
+Customer --> UC_WAL
+Customer --> UC_TOP
+Customer --> UC_BRO
+Customer --> UC_INQ
+Customer --> UC_PAY
+Customer --> UC_RFQ
+
+' --- Agent capabilities (agent also uses the customer-facing ones) ---
+Agent --> UC_AGP : pays on behalf of customers
+Agent --> UC_TOP : cash top-up for customers
+Agent --> UC_BRO
+Agent --> UC_INQ
+Agent --> UC_WAL : own wallet and commission
+
+' --- Back office ---
+UC_SRC <-- Support
+UC_BLK <-- Support
+UC_RFA <-- Support
+
+UC_VER <-- Admin
+UC_MAN <-- Admin
+UC_CFG <-- Admin
+UC_TOT <-- Admin
+UC_AUD <-- Admin
+
+UC_REC <-- Finance
+UC_AUD <-- Finance
+
+' --- System-triggered ---
+Timer --> UC_UNK : no biller response within timeout
+Timer --> UC_RTY : retry after 1, 5, 15 min;\nrecover FundsHeld / SentToBiller
+Timer --> UC_NRT : retry up to 3 times
+Timer --> UC_RFF : Failed -> Refunded
+
+' --- Includes ---
+UC_PAY ..> UC_FRD : <<include>>
+UC_PAY ..> UC_FEE : <<include>>
+UC_PAY ..> UC_NOT : <<include>>
+UC_AGP ..> UC_PAY : <<include>>
+UC_RFF ..> UC_NOT : <<include>>
+UC_NRT ..> UC_NOT : <<include>>
+
+' Inquiry is optional for the customer (decision #26): no include from UC_PAY.
+' Exception: services flagged requireExactAmount (AquaCo) call inquire() inside Pay a bill.
+
+' --- Extends (with their conditions) ---
+UC_UNK ..> UC_PAY : <<extend>>\n{payment result unknown / timed out}
+UC_CB ..> UC_UNK : <<extend>>\n{late result for an Unknown payment}
+
+' --- External system links ---
+UC_INQ <-- Biller
+UC_PAY <-- Biller
+UC_CB <-- Biller
+UC_REC --> Biller : settlement\nfile
+UC_NOT --> Notifier
+
+@enduml
