@@ -1,0 +1,48 @@
+@startuml 04-seq-refund-failed
+title PayLink - Sequence Diagram: Refund a Failed Payment
+autonumber
+skinparam shadowing false
+
+actor "System / Support" as Actor
+participant "PaymentService" as PaySvc
+participant "WalletService" as Wallet
+participant "NotificationService\n(PaymentObserver)" as Notif
+database "PostgreSQL (Ledger & Audit)" as DB
+
+note over Actor, DB
+  Rules:
+  - Unknown payments are NEVER auto-refunded.
+  - Failed -> Refunded releases held funds with ledger entries (no balance column).
+  - Refunded is a final state and is reachable ONLY from Failed.
+  - Refund of a Completed payment is a different flow (refund_requests table,
+    REFUND + COMMISSION_REVERSAL entries, payment stays Completed) - Could priority.
+end note
+
+Actor -> PaySvc : refundFailedPayment(paymentId, reason)
+PaySvc -> DB : BEGIN; SELECT payment FOR UPDATE (locks payment and wallet row)
+
+alt Payment state is Unknown
+  PaySvc -> DB : ROLLBACK
+  PaySvc --> Actor : rejected - Unknown is never auto-refunded (stays Unknown until resolved)
+else Payment state is Failed
+  PaySvc -> Wallet : release(payment)
+  Wallet -> DB : append RELEASE entries (HELD -total, AVAILABLE +total, same group_id)
+  Wallet -> DB : append audit_logs entry (who, when, what, why)
+  PaySvc -> DB : payment Failed -> Refunded + payment_state_changes
+  PaySvc -> DB : COMMIT
+  PaySvc -> Notif : onPaymentEvent(payment, HOLD_RELEASED)
+  Notif -> DB : insert SMS / PUSH notification (type REFUNDED, status PENDING)
+  Notif -> Notif : dispatch (retry up to 3x, then UNDELIVERED)
+  note right of Notif
+    Notification failure never rolls back
+    ledger entries or the Refunded state.
+  end note
+  PaySvc --> Actor : Refunded confirmation
+else Payment is already Refunded
+  PaySvc -> DB : ROLLBACK
+  PaySvc --> Actor : idempotent success (no second release)
+else Payment is in any other state (Initiated, FundsHeld, SentToBiller, Completed, Rejected)
+  PaySvc -> DB : ROLLBACK
+  PaySvc --> Actor : invalid transition error (logged)
+end
+@enduml

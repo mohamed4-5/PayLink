@@ -1,0 +1,120 @@
+@startuml 03-seq-pay-bill
+title PayLink - Sequence Diagram: Pay a Bill
+autonumber
+skinparam shadowing false
+
+actor "Customer / Agent" as Actor
+participant "PaymentController / API" as API
+participant "PaymentService" as PaySvc
+participant "FraudRule Chain" as Fraud
+participant "FeeService" as FeeSvc
+participant "WalletService" as Wallet
+participant "BillerAdapterFactory" as Factory
+participant "BillerAdapter" as Adapter
+participant "Biller System" as Biller
+participant "NotificationService\n(PaymentObserver)" as Notif
+database "PostgreSQL" as DB
+
+note over Actor, DB
+  Agent flow: Actor is the agent, the customer wallet is debited,
+  agent_account_id is stored on the payment and earns the commission.
+  All amounts are integer piasters (BIGINT). Config values come from ConfigService.
+end note
+
+Actor -> API : POST /payments (Idempotency-Key, serviceId, amount, fields)
+API -> PaySvc : pay(request, idempotencyKey)
+PaySvc -> DB : find idempotency_keys(customer_account_id, idem_key)
+
+alt Duplicate key with same payload
+  DB --> PaySvc : existing payment
+  PaySvc --> API : saved response
+  API --> Actor : 200 OK (original result)
+else Duplicate key with different payload
+  PaySvc --> API : 409 Conflict
+  API --> Actor : error (payload mismatch)
+else New request
+  PaySvc -> DB : insert idempotency key + payment (Initiated) + state change
+  PaySvc -> FeeSvc : quote(service, amount, now)
+  FeeSvc --> PaySvc : fee, total, commission
+  PaySvc -> Fraud : check(AmountRange, AccountBlocked, DailyLimit, Velocity)
+
+  alt Fraud check fails
+    Fraud --> PaySvc : Verdict(reason, blockAccountUntil?)
+    opt Velocity rule triggered
+      PaySvc -> DB : account.blocked_until = now + 10 min (config) + audit log
+    end
+    PaySvc -> DB : payment Initiated -> Rejected + state change + audit log
+    PaySvc --> API : Rejected (reason)
+    API --> Actor : 422 Rejected
+  else Fraud checks pass
+    opt service.requireExactAmount (AquaCo)
+      PaySvc -> Adapter : inquire(fields)
+      Adapter --> PaySvc : bill amount
+      note right of PaySvc
+        If amount differs from the bill:
+        payment Initiated -> Rejected
+        ("amount must equal bill"), no money moves.
+      end note
+    end
+    PaySvc -> Wallet : hold(wallet, payment)
+    Wallet -> DB : lock customer wallet row, compute available from ledger
+
+    alt Insufficient available balance
+      Wallet --> PaySvc : INSUFFICIENT_FUNDS
+      PaySvc -> DB : payment Initiated -> Rejected + state change + audit log
+      PaySvc --> API : Rejected (insufficient funds)
+      API --> Actor : 422 Rejected
+    else Enough balance
+      Wallet -> DB : insert HOLD entries (AVAILABLE -total, HELD +total)
+      PaySvc -> DB : payment Initiated -> FundsHeld
+      note over PaySvc, DB
+        Commit here. If the app crashes after this point, the recovery job
+        (US-13 / decision #15) resumes the payment with the SAME reference.
+      end note
+      PaySvc -> Factory : forBiller(billerCode)
+      Factory --> PaySvc : adapter
+      PaySvc -> DB : payment FundsHeld -> SentToBiller
+      PaySvc -> Adapter : pay(reference, amount, fields)
+      Adapter -> Biller : send payment (unique reference = idempotency key at biller)
+
+      alt Biller confirms immediately
+        Biller --> Adapter : confirmed
+        Adapter --> PaySvc : BillerResult(PAID)
+        PaySvc -> Wallet : charge(payment)
+        Wallet -> DB : insert CHARGE (customer HELD -total, biller payable +amount)\nand FEE (platform revenue +fee) entries
+        opt agent payment and fee > 0
+          PaySvc -> Wallet : creditCommission(agentWallet, payment)
+          Wallet -> DB : insert COMMISSION entries (platform revenue -commission, agent AVAILABLE +commission)
+        end
+        PaySvc -> DB : payment SentToBiller -> Completed + state change + audit log
+        PaySvc -> Notif : onPaymentEvent(payment, BILLER_CONFIRMED)
+        Notif -> DB : insert SMS + PUSH notifications (type COMPLETED)
+        PaySvc --> API : Completed
+        API --> Actor : 200 OK (Completed)
+      else Biller refuses
+        Biller --> Adapter : refused (errorCode)
+        Adapter --> PaySvc : BillerResult(FAILED, reason)
+        PaySvc -> DB : payment SentToBiller -> Failed + state change
+        PaySvc -> Wallet : release(payment)
+        Wallet -> DB : insert RELEASE entries (HELD -total, AVAILABLE +total) + audit log
+        PaySvc -> DB : payment Failed -> Refunded + state change
+        PaySvc -> Notif : onPaymentEvent(payment, HOLD_RELEASED)
+        Notif -> DB : insert failure SMS (type FAILED)
+        PaySvc --> API : Failed (hold released, Refunded)
+        API --> Actor : payment failed, money returned
+      else Timeout (>10s, config) or async accepted (TopUpNet)
+        Biller --> Adapter : timeout / accepted
+        Adapter --> PaySvc : BillerResult(UNKNOWN)
+        PaySvc -> DB : payment SentToBiller -> Unknown,\nretry_attempt = 0, next_retry_at = now + 1 min (config)\n(funds stay HELD)
+        PaySvc --> API : 202 Accepted (being processed)
+        API --> Actor : being processed (reference)
+        note right of PaySvc
+          Later (not in this request): RetryUnknownCommand queries the biller
+          after 1, 5, 15 min; a callback may also arrive.
+          Result -> Completed or Failed. Never auto-refunded while Unknown.
+        end note
+      end
+    end
+  end
+end
+@enduml

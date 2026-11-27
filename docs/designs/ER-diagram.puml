@@ -1,0 +1,211 @@
+@startuml 06-er-diagram
+title PayLink - Entity Relationship Diagram (PostgreSQL)
+skinparam shadowing false
+skinparam linetype ortho
+
+note as N1
+  Money columns are BIGINT piasters (EGP). No balance column anywhere:
+  balances = SUM(ledger_entries.amount_piasters) per wallet and bucket.
+  ledger_entries and audit_logs are append-only (no UPDATE / DELETE).
+  Every ledger group_id sums to zero across wallets (double-entry).
+  Unique constraints not shown as columns:
+  - idempotency_keys (account_id, idem_key)
+  - wallets: one USER wallet per account; one BILLER_PAYABLE wallet per biller
+  - biller_services (biller_id, code)
+end note
+
+entity "accounts" as accounts {
+  * id : UUID <<PK>>
+  --
+  * name : VARCHAR(120)
+  * phone : VARCHAR(30) <<UK>>
+  * password_hash : VARCHAR(255)
+  * role : VARCHAR(20)
+  * verification_level : VARCHAR(20)
+  * status : VARCHAR(20)
+  blocked_until : TIMESTAMPTZ
+  * created_at : TIMESTAMPTZ
+}
+
+entity "wallets" as wallets {
+  * id : UUID <<PK>>
+  --
+  * account_id : UUID <<FK>>
+  biller_id : UUID <<FK>>
+  * kind : VARCHAR(20)
+  * currency : VARCHAR(10)
+  * created_at : TIMESTAMPTZ
+}
+
+entity "ledger_entries" as ledger_entries {
+  * id : UUID <<PK>>
+  --
+  * wallet_id : UUID <<FK>>
+  * group_id : UUID
+  payment_id : UUID <<FK>>
+  refund_request_id : UUID <<FK>>
+  * entry_type : VARCHAR(30)
+  * bucket : VARCHAR(20)
+  * amount_piasters : BIGINT
+  * created_at : TIMESTAMPTZ
+}
+
+entity "billers" as billers {
+  * id : UUID <<PK>>
+  --
+  * code : VARCHAR(40) <<UK>>
+  * name : VARCHAR(120)
+  * protocol : VARCHAR(30)
+  * active : BOOLEAN
+}
+
+entity "biller_services" as biller_services {
+  * id : UUID <<PK>>
+  --
+  * biller_id : UUID <<FK>>
+  * code : VARCHAR(50)
+  * category : VARCHAR(30)
+  * min_amount_piasters : BIGINT
+  * max_amount_piasters : BIGINT
+  * require_exact_amount : BOOLEAN
+  input_fields : JSONB
+  * active : BOOLEAN
+}
+
+entity "payments" as payments {
+  * id : UUID <<PK>>
+  --
+  * reference : VARCHAR(64) <<UK>>
+  biller_reference : VARCHAR(80)
+  * customer_account_id : UUID <<FK>>
+  agent_account_id : UUID <<FK>>
+  * biller_service_id : UUID <<FK>>
+  * bill_fields : JSONB
+  * state : VARCHAR(20)
+  * amount_piasters : BIGINT
+  * fee_piasters : BIGINT
+  * commission_piasters : BIGINT
+  * total_piasters : BIGINT
+  failure_reason : TEXT
+  * retry_attempt : SMALLINT
+  next_retry_at : TIMESTAMPTZ
+  * created_at : TIMESTAMPTZ
+  * updated_at : TIMESTAMPTZ
+}
+
+entity "payment_state_changes" as payment_state_changes {
+  * id : UUID <<PK>>
+  --
+  * payment_id : UUID <<FK>>
+  from_state : VARCHAR(20)
+  * to_state : VARCHAR(20)
+  reason : TEXT
+  * changed_at : TIMESTAMPTZ
+}
+
+entity "refund_requests" as refund_requests {
+  * id : UUID <<PK>>
+  --
+  * payment_id : UUID <<FK>>
+  * requested_by : UUID <<FK>>
+  decided_by : UUID <<FK>>
+  * status : VARCHAR(20)
+  reason : TEXT
+  * created_at : TIMESTAMPTZ
+  decided_at : TIMESTAMPTZ
+}
+
+entity "idempotency_keys" as idempotency_keys {
+  * id : UUID <<PK>>
+  --
+  * account_id : UUID <<FK>>
+  * idem_key : VARCHAR(120)
+  * request_hash : VARCHAR(128)
+  payment_id : UUID <<FK>>
+  * expires_at : TIMESTAMPTZ
+  * created_at : TIMESTAMPTZ
+}
+
+entity "notifications" as notifications {
+  * id : UUID <<PK>>
+  --
+  payment_id : UUID <<FK>>
+  * recipient_account_id : UUID <<FK>>
+  * type : VARCHAR(20)
+  * channel : VARCHAR(20)
+  * status : VARCHAR(20)
+  * attempts : INT
+  next_attempt_at : TIMESTAMPTZ
+  * updated_at : TIMESTAMPTZ
+}
+
+entity "settlement_files" as settlement_files {
+  * id : UUID <<PK>>
+  --
+  * biller_id : UUID <<FK>>
+  * file_date : DATE
+  * imported_at : TIMESTAMPTZ
+}
+
+entity "settlement_file_rows" as settlement_file_rows {
+  * id : UUID <<PK>>
+  --
+  * settlement_file_id : UUID <<FK>>
+  * payment_reference : VARCHAR(64)
+  biller_reference : VARCHAR(80)
+  * amount_piasters : BIGINT
+  * status_in_file : VARCHAR(20)
+}
+
+entity "reconciliation_differences" as reconciliation_differences {
+  * id : UUID <<PK>>
+  --
+  * settlement_file_id : UUID <<FK>>
+  settlement_file_row_id : UUID <<FK>>
+  payment_id : UUID <<FK>>
+  * diff_type : VARCHAR(30)
+  * status : VARCHAR(20)
+  * created_at : TIMESTAMPTZ
+}
+
+entity "audit_logs" as audit_logs {
+  * id : UUID <<PK>>
+  --
+  actor_account_id : UUID <<FK>>
+  * action : VARCHAR(80)
+  * target_type : VARCHAR(60)
+  target_id : VARCHAR(80)
+  reason : TEXT
+  * created_at : TIMESTAMPTZ
+}
+
+entity "system_configs" as system_configs {
+  * config_key : VARCHAR(80) <<PK>>
+  --
+  * config_value : JSONB
+  * updated_at : TIMESTAMPTZ
+}
+
+accounts ||--|{ wallets : "owns"
+billers ||--o| wallets : "payable wallet"
+wallets ||--o{ ledger_entries : "records"
+payments ||--o{ ledger_entries : "links"
+refund_requests ||--o{ ledger_entries : "links"
+accounts ||--o{ payments : "pays"
+accounts ||--o{ payments : "assists as agent"
+billers ||--o{ biller_services : "offers"
+biller_services ||--o{ payments : "billed by"
+payments ||--o{ payment_state_changes : "history"
+payments ||--o{ refund_requests : "refund of Completed"
+accounts ||--o{ refund_requests : "requests / decides"
+accounts ||--o{ idempotency_keys : "scopes"
+payments ||--o| idempotency_keys : "produces"
+payments ||--o{ notifications : "triggers"
+accounts ||--o{ notifications : "receives"
+billers ||--o{ settlement_files : "sends"
+settlement_files ||--o{ settlement_file_rows : "has rows"
+settlement_files ||--o{ reconciliation_differences : "contains"
+settlement_file_rows ||--o{ reconciliation_differences : "explains"
+payments ||--o{ reconciliation_differences : "matches"
+accounts ||--o{ audit_logs : "performs"
+@enduml

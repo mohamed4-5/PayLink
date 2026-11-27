@@ -1,0 +1,56 @@
+@startuml 05-state-payment
+title PayLink - Payment Life Cycle State Diagram
+skinparam shadowing false
+
+[*] --> Initiated : payment created
+
+state Initiated
+state FundsHeld
+state SentToBiller
+state Unknown
+state Failed
+state Completed <<final>>
+state Rejected <<final>>
+state Refunded <<final>>
+
+Initiated --> FundsHeld : fraud checks pass &\nsufficient available balance
+Initiated --> Rejected : fraud check fails,\nbill amount mismatch or\ninsufficient funds
+
+FundsHeld --> SentToBiller : payment request sent\nto biller with reference
+
+SentToBiller --> Completed : biller confirms payment
+SentToBiller --> Failed : biller refuses payment
+SentToBiller --> Unknown : timeout (>10s) or\nasync pending (TopUpNet)
+
+Unknown --> Completed : later confirmation\n(callback / retry / settlement)
+Unknown --> Failed : later refusal or\nnot found in settlement
+
+Failed --> Refunded : held funds released\nto wallet via ledger
+
+Completed --> [*]
+Rejected --> [*]
+Refunded --> [*]
+
+note right of Unknown
+  - Money stays in HELD balance.
+  - Re-queried after 1, 5 and 15 min (config),
+    then checked in reconciliation.
+  - Applies to timeouts AND TopUpNet async payments
+    (a callback may resolve it earlier).
+  - NEVER auto-refunded while Unknown.
+end note
+
+note left of FundsHeld
+  Crash recovery (no extra states):
+  - stuck in FundsHeld -> resume: send to the biller
+    with the SAME reference (idempotent at biller).
+  - stuck in SentToBiller -> query(reference):
+    PAID -> Completed, FAILED -> Failed, no answer -> Unknown.
+end note
+
+note bottom of Completed
+  Completed stays Completed even after a refund.
+  A refund of a Completed payment is a RefundRequest +
+  REFUND / COMMISSION_REVERSAL ledger entries, not a state change.
+end note
+@enduml
