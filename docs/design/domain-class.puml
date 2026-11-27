@@ -1,0 +1,294 @@
+@startuml 02-domain-class
+title PayLink - Domain class diagram
+skinparam shadowing false
+skinparam classAttributeIconSize 0
+hide empty members
+
+package "Shared kernel" {
+  class Money <<value object>> {
+    - piasters : bigint
+    + {static} egp(amount : string) : Money
+    + add(o : Money) : Money
+    + subtract(o : Money) : Money
+    + percent(rate : string) : Money   // round half-up to 2 decimals
+    + isNegative() : boolean
+    + compareTo(o : Money) : number
+  }
+}
+
+package "Accounts and Wallet" {
+  enum Role {
+  CUSTOMER
+  AGENT
+  SUPPORT
+  ADMIN
+  SYSTEM
+}
+  enum VerificationLevel {
+  BASIC
+  VERIFIED
+}
+  enum AccountStatus {
+  ACTIVE
+  BLOCKED
+}
+
+  class Account {
+    id : UUID
+    name : string
+    phone : string
+    role : Role
+    level : VerificationLevel
+    status : AccountStatus
+    blockedUntil : DateTime
+    + isBlocked(now : DateTime) : boolean
+    + upgrade() : void
+    + block(until : DateTime) : void
+    + unblock() : void
+  }
+
+  class Wallet {
+    id : UUID
+    currency : "EGP"
+    + available() : Money   // SUM(ledger, AVAILABLE)
+    + held() : Money        // SUM(ledger, HELD)
+  }
+
+  enum EntryType {
+  TOPUP
+  HOLD
+  CHARGE
+  RELEASE
+  FEE
+  COMMISSION
+  COMMISSION_REVERSAL
+  REFUND
+}
+  enum Bucket {
+  AVAILABLE
+  HELD
+}
+
+  class LedgerEntry <<append-only>> {
+    id : UUID
+    groupId : UUID
+    type : EntryType
+    bucket : Bucket
+    amount : Money   // signed
+    createdAt : DateTime
+  }
+
+  class WalletService <<service>> {
+    + topUp(wallet, amount) : LedgerEntry[]
+    + hold(wallet, payment) : void   // locks wallet row
+    + charge(payment) : void
+    + release(payment) : void
+    + credit(wallet, amount, type) : void
+  }
+}
+
+package "Biller Catalog" {
+  class Biller {
+    id : UUID
+    code : string
+    name : string
+    protocol : string
+    active : boolean
+  }
+  class BillerService {
+    id : UUID
+    code : string
+    category : ELECTRICITY | WATER | TOPUP | INTERNET
+    minAmount : Money
+    maxAmount : Money
+    inputFields : FieldSpec[]
+    active : boolean
+  }
+}
+
+package "Payment Processing" {
+  class Payment {
+    id : UUID
+    reference : string
+    idempotencyKey : string
+    amount : Money
+    fee : Money
+    total : Money
+    failureReason : string
+    createdAt : DateTime
+    + state() : PaymentState
+    + apply(event : PaymentEvent) : void
+  }
+
+  interface PaymentState <<State pattern>> {
+    + name() : string
+    + isFinal() : boolean
+    + onEvent(p : Payment, e : PaymentEvent) : PaymentState
+  }
+  class Initiated
+  class FundsHeld
+  class SentToBiller
+  class Unknown
+  class Failed
+  class Completed <<final>>
+  class Rejected <<final>>
+  class Refunded <<final>>
+
+  class PaymentStateChange <<append-only>> {
+    from : string
+    to : string
+    reason : string
+    at : DateTime
+  }
+
+  class PaymentService <<service>> {
+    + inquire(request) : Quote
+    + pay(request, idempotencyKey) : Payment
+    + onBillerResult(ref, result) : void
+  }
+  class IdempotencyRecord {
+    key : string
+    requestHash : string
+    expiresAt : DateTime
+  }
+  class RetryUnknownCommand <<Command>> {
+    paymentId : UUID
+    attempt : 1..3
+    + execute() : void
+  }
+}
+
+package "Biller Integration" {
+  interface BillerAdapter <<Adapter>> {
+    + inquire(fields) : BillAmount
+    + pay(ref, amount, fields) : BillerResult
+    + query(ref) : BillerResult
+  }
+  class ElectroCoAdapter
+  class AquaCoAdapter
+  class TopUpNetAdapter
+  class NetCoBatchAdapter
+  class BillerAdapterFactory <<Factory>> {
+    + forBiller(code : string) : BillerAdapter
+  }
+}
+
+package "Fees and Commissions" {
+  interface FeeStrategy <<Strategy>> {
+    + fee(amount : Money) : Money
+  }
+  class FixedFee
+  class PercentageFee
+  class TieredFee
+  class PromotionFee
+  class FeeService <<service>> {
+    + quote(service, amount, at) : Money
+    + commission(fee : Money) : Money
+  }
+}
+
+package "Fraud Checks" {
+  abstract class FraudRule <<Chain of Responsibility>> {
+    - next : FraudRule
+    + check(ctx : PaymentContext) : Verdict
+  }
+  class AmountRangeRule
+  class AccountBlockedRule
+  class DailyLimitRule
+  class VelocityRule
+}
+
+package "Notifications" {
+  interface PaymentObserver <<Observer>> {
+    + onPaymentEvent(p : Payment, e : PaymentEvent) : void
+  }
+  class NotificationService <<service>>
+  class Notification {
+    channel : SMS | PUSH
+    status : PENDING | SENT | UNDELIVERED
+    attempts : int
+  }
+}
+
+package "Reconciliation" {
+  class SettlementFile {
+    billerId : UUID
+    fileDate : Date
+  }
+  class ReconciliationDifference {
+    type : MISSING | EXTRA | AMOUNT_MISMATCH | FAILED_IN_FILE
+    status : OPEN | REVIEWED
+  }
+}
+
+class AuditRecord <<append-only>> {
+  actor : UUID
+  at : DateTime
+  action : string
+  reason : string
+}
+class SystemConfig {
+  key : string
+  value : json
+}
+
+Account "1" -- "1" Wallet
+Wallet "1" -- "*" LedgerEntry
+LedgerEntry "*" -- "0..1" Payment
+Account "1" -- "*" Payment : pays >
+Account "0..1" -- "*" Payment : agent >
+Biller "1" -- "*" BillerService
+BillerService "1" -- "*" Payment
+Payment "1" -- "*" PaymentStateChange
+Payment ..> Money
+Payment o-- PaymentState
+Payment "1" -- "0..1" IdempotencyRecord
+
+PaymentState <|.. Initiated
+PaymentState <|.. FundsHeld
+PaymentState <|.. SentToBiller
+PaymentState <|.. Unknown
+PaymentState <|.. Failed
+PaymentState <|.. Completed
+PaymentState <|.. Rejected
+PaymentState <|.. Refunded
+
+BillerAdapter <|.. ElectroCoAdapter
+BillerAdapter <|.. AquaCoAdapter
+BillerAdapter <|.. TopUpNetAdapter
+BillerAdapter <|.. NetCoBatchAdapter
+BillerAdapterFactory ..> BillerAdapter : creates
+
+FeeStrategy <|.. FixedFee
+FeeStrategy <|.. PercentageFee
+FeeStrategy <|.. TieredFee
+FeeStrategy <|.. PromotionFee
+FeeService ..> FeeStrategy
+FeeService ..> SystemConfig
+
+FraudRule <|-- AmountRangeRule
+FraudRule <|-- AccountBlockedRule
+FraudRule <|-- DailyLimitRule
+FraudRule <|-- VelocityRule
+FraudRule o-- FraudRule : next
+
+PaymentService ..> FraudRule
+PaymentService ..> FeeService
+PaymentService ..> WalletService
+PaymentService ..> BillerAdapterFactory
+PaymentService ..> RetryUnknownCommand
+PaymentService ..> AuditRecord
+
+PaymentObserver <|.. NotificationService
+Payment ..> PaymentObserver : notifies >
+NotificationService "1" -- "*" Notification
+
+SettlementFile "1" -- "*" ReconciliationDifference
+ReconciliationDifference "*" -- "0..1" Payment
+
+Account --> Role
+Account --> VerificationLevel
+Account --> AccountStatus
+LedgerEntry --> EntryType
+LedgerEntry --> Bucket
+@enduml
